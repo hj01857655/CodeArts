@@ -4,6 +4,8 @@
 
 底层走华为云 `SDK-HMAC-SHA256` 请求签名，AK/SK 存放在 `.env`。
 ## 新增免费层级模型，可使用benefit.py一键签到并通过server.py调用
+> [!TIP]
+> 建议使用opencode，pi，hermes，openclaw作为智能体接入。免费codearts具有5并发限制，其他代码智能体通常会超过这个限制，从而影响体验
 
 ## 使用方法
 
