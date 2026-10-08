@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import urllib.parse
 
@@ -25,12 +26,13 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 
+import benefit
+import credential_provider
+
 load_dotenv()
 
-AK = os.getenv("CODEARTS_AK", "").strip()
-SK = os.getenv("CODEARTS_SK", "").strip()
-if not AK or not SK:
-    raise SystemExit("缺少 CODEARTS_AK / CODEARTS_SK，请在 .env 中配置后重试")
+def _current_creds() -> dict:
+    return credential_provider.cred_and_env()
 
 # CodeArts 目标端点（从抓包确认）
 BASE_URL = "https://snap-access.cn-north-4.myhuaweicloud.com"
@@ -53,6 +55,8 @@ FALLBACK_MODELS = FALLBACK_AGENT_MODELS + BENEFIT_MODELS
 # opengw 免费额度网关（IDE 抓包确认）：永久 AK/SK 即可访问，gateway/config 返回免费模型列表
 OPENGW_BASE = "https://opengw.developer.huaweicloud.com"
 OPENGW_CONFIG_URL = OPENGW_BASE + "/api/v1/gateway/config"
+# 模型同步时自动领取限时福利（幂等；不领取则福利模型调用必报 benefit not found）
+BENEFIT_AUTO_CLAIM = os.getenv("CODEARTS_BENEFIT_AUTO_CLAIM", "1").strip() not in ("0", "false", "False", "no", "")
 # 模型缓存与代理程序放在同一目录，便于迁移、备份和排查
 MODEL_CACHE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "models-cache.json"
@@ -72,6 +76,7 @@ app = Flask(__name__)
 
 def _signed_request(method: str, url: str, body: bytes = b"", extra_headers=None, timeout=30):
     """发送带华为云 SDK-HMAC-SHA256 签名的请求。"""
+    creds = _current_creds()
     parsed = urllib.parse.urlparse(url)
     path = parsed.path or "/"
     canonical_uri = path if path.endswith("/") else path + "/"
@@ -89,6 +94,8 @@ def _signed_request(method: str, url: str, body: bytes = b"", extra_headers=None
     headers.setdefault("content-type", "application/json")
     sdk_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     headers["x-sdk-date"] = sdk_date
+    if creds.get("token"):
+        headers["x-security-token"] = creds["token"]
 
     signed_names = sorted(headers)
     canonical_headers = "".join(
@@ -105,10 +112,10 @@ def _signed_request(method: str, url: str, body: bytes = b"", extra_headers=None
         f"{hashlib.sha256(canonical_request.encode()).hexdigest()}"
     )
     signature = hmac.new(
-        SK.encode(), string_to_sign.encode(), hashlib.sha256
+        creds["sk"].encode(), string_to_sign.encode(), hashlib.sha256
     ).hexdigest()
     headers["authorization"] = (
-        f"SDK-HMAC-SHA256 Access={AK}, SignedHeaders={signed_headers}, "
+        f"SDK-HMAC-SHA256 Access={creds['ak']}, SignedHeaders={signed_headers}, "
         f"Signature={signature}"
     )
     return requests.request(
@@ -122,6 +129,7 @@ def _hmac_headers(body: bytes, benefit: bool = False, model_id: str = "") -> dic
     benefit=True 时按 IDE 免费模型通道附加 maas_type / model-id / model-name 三个头，
     这三个头必须参与签名，否则上游返回 "The model is not registered"。
     """
+    creds = _current_creds()
     now = datetime.datetime.now(datetime.timezone.utc)
     sdk_date = now.strftime("%Y%m%dT%H%M%SZ")
 
@@ -131,6 +139,8 @@ def _hmac_headers(body: bytes, benefit: bool = False, model_id: str = "") -> dic
         "content-type": "application/json",
         "x-sdk-date": sdk_date,
     }
+    if creds.get("token"):
+        headers["x-security-token"] = creds["token"]
     if benefit and model_id:
         headers["maas_type"] = "benefit"
         headers["model-id"] = model_id
@@ -152,10 +162,10 @@ def _hmac_headers(body: bytes, benefit: bool = False, model_id: str = "") -> dic
     hashed_canonical = hashlib.sha256(canonical_request.encode()).hexdigest()
     string_to_sign = f"SDK-HMAC-SHA256\n{sdk_date}\n{hashed_canonical}"
 
-    signature = hmac.new(SK.encode(), string_to_sign.encode(), hashlib.sha256).hexdigest()
+    signature = hmac.new(creds["sk"].encode(), string_to_sign.encode(), hashlib.sha256).hexdigest()
 
     headers["Authorization"] = (
-        f"SDK-HMAC-SHA256 Access={AK}, "
+        f"SDK-HMAC-SHA256 Access={creds['ak']}, "
         f"SignedHeaders={signed_headers}, Signature={signature}"
     )
     return headers
@@ -202,6 +212,13 @@ def _refresh_benefit_models() -> list:
 
     返回模型详情列表；失败时返回空列表，由调用方回退到 BENEFIT_MODELS 兜底。
     """
+    # 先领取限时福利（幂等）：未领取时福利模型调用必报 InferHub.4004.200 benefit not found。
+    # 领取失败只记日志，不阻断模型列表同步。
+    if BENEFIT_AUTO_CLAIM:
+        try:
+            benefit.claim()
+        except Exception as error:
+            print("限时福利自动领取失败（不影响模型列表同步）:", error)
     try:
         response = _signed_request("GET", OPENGW_CONFIG_URL, timeout=30)
         response.raise_for_status()
@@ -580,9 +597,10 @@ def chat_completions():
 
     try:
         upstream = requests.post(
-            TARGET, data=body, headers=headers, stream=True, timeout=600
+            TARGET, data=body, headers=headers, stream=True, timeout=(10, 600)
         )
     except Exception as e:
+        print(f"[502] 上游请求异常: {e}")
         return _cors(jsonify({"error": {"message": f"upstream error: {e}"}})), 502
 
     if upstream.status_code != 200:
@@ -590,6 +608,7 @@ def chat_completions():
             detail = upstream.text[:2000]
         except Exception:
             detail = ""
+        print(f"[502] 上游返回非 200: status={upstream.status_code} body={detail}")
         return (
             _cors(
                 jsonify(
@@ -692,6 +711,7 @@ def chat_completions():
     # 仍返回 text/event-stream；直接转发会导致客户端把 data: 当作 JSON 解析。
     result = _parse_upstream_json(upstream)
     if isinstance(result, dict) and result.get("error"):
+        print(f"[502] 上游业务错误: {result.get('error')}")
         resp = Response(
             json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             status=502,
@@ -703,12 +723,55 @@ def chat_completions():
     return _cors(resp)
 
 
+_last_checkin_date = None
+
+
+def _benefit_checkin_loop():
+    """后台每日自动签到领取限时福利（幂等），成功后打印余额。
+
+    启动即签到一次，之后每小时检查是否跨入新的一天；跨了就再签。
+    先查签到状态，当天已签则跳过；领取失败不标记日期，下一小时自动重试。
+    """
+    global _last_checkin_date
+    while True:
+        today = datetime.date.today()
+        if _last_checkin_date != today:
+            try:
+                # 先查签到状态，当天已签则跳过
+                try:
+                    status = benefit.claim_status()
+                    last_ms = status.get("create_time")
+                    if last_ms and datetime.datetime.fromtimestamp(last_ms / 1000).date() == today:
+                        _last_checkin_date = today
+                        print(f"[签到] {today} 当天已签到，跳过")
+                        time.sleep(3600)
+                        continue
+                except Exception:
+                    pass  # 查不到状态就继续尝试领取
+                benefit.claim()
+                _last_checkin_date = today
+                info = benefit.balance()
+                total = info.get("total_quota") or 0
+                remain = info.get("total_balance") or 0
+                print(f"[签到] {today} 限时福利领取成功，余额 {remain:,}/{total:,}")
+            except Exception as error:
+                print(f"[签到] {today} 限时福利领取失败: {error}")
+        time.sleep(3600)
+
+
 if __name__ == "__main__":
     # 启动时先同步一次真实模型列表（失败则回退到缓存/兜底列表），再打印。
     if not _refresh_models():
         _load_model_cache()
+    creds = _current_creds()
+    if creds.get("token"):
+        print("凭证来源: CodeArts IDE 会话", credential_provider.token_notice(creds))
+    else:
+        print("凭证来源: 未找到 IDE 会话凭证，请在 CodeArts IDE 中登录")
     print(f"CodeArts OpenAI 兼容代理已启动: http://{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"OpenAI Base URL: http://{LISTEN_HOST}:{LISTEN_PORT}/v1")
     print("可用模型:", SUPPORTED_MODELS)
     print("按 Ctrl+C 停止")
+    if BENEFIT_AUTO_CLAIM:
+        threading.Thread(target=_benefit_checkin_loop, daemon=True, name="benefit-checkin").start()
     app.run(host=LISTEN_HOST, port=LISTEN_PORT, threaded=True)

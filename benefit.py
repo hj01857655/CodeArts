@@ -9,7 +9,7 @@ CodeArts 免费额度签到/查询工具
     GET  /api/v1/user/tokens/balance  查询免费额度余额
     GET  /api/v1/gateway/config       免费模型列表
 
-用法（需先在 .env 配置 CODEARTS_AK / CODEARTS_SK）：
+用法（凭证由 CodeArts IDE 会话自动读取，无需配置）：
 
     python benefit.py            # 签到 + 查询余额
     python benefit.py status     # 只查询，不签到
@@ -30,12 +30,12 @@ import urllib.parse
 import requests
 from dotenv import load_dotenv
 
+import credential_provider
+
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-AK = os.getenv("CODEARTS_AK", "").strip()
-SK = os.getenv("CODEARTS_SK", "").strip()
-if not AK or not SK:
-    raise SystemExit("缺少 CODEARTS_AK / CODEARTS_SK，请在 .env 中配置后重试")
+def _current_creds() -> dict:
+    return credential_provider.cred_and_env()
 
 OPENGW_BASE = "https://opengw.developer.huaweicloud.com"
 CLAIM_URL = OPENGW_BASE + "/api/v1/benefit/claim"
@@ -45,6 +45,7 @@ CONFIG_URL = OPENGW_BASE + "/api/v1/gateway/config"
 
 def signed_request(method: str, url: str, body: bytes = b"") -> requests.Response:
     """发送带华为云 SDK-HMAC-SHA256 签名的请求（与 IDE 一致：host/content-type/x-sdk-date）。"""
+    creds = _current_creds()
     parsed = urllib.parse.urlparse(url)
     path = parsed.path or "/"
     canonical_uri = path if path.endswith("/") else path + "/"
@@ -58,6 +59,8 @@ def signed_request(method: str, url: str, body: bytes = b"") -> requests.Respons
     }
     sdk_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     headers["x-sdk-date"] = sdk_date
+    if creds.get("token"):
+        headers["x-security-token"] = creds["token"]
 
     signed_names = sorted(headers)
     canonical_headers = "".join(f"{name}:{headers[name].strip()}\n" for name in signed_names)
@@ -71,9 +74,9 @@ def signed_request(method: str, url: str, body: bytes = b"") -> requests.Respons
         f"SDK-HMAC-SHA256\n{sdk_date}\n"
         f"{hashlib.sha256(canonical_request.encode()).hexdigest()}"
     )
-    signature = hmac.new(SK.encode(), string_to_sign.encode(), hashlib.sha256).hexdigest()
+    signature = hmac.new(creds["sk"].encode(), string_to_sign.encode(), hashlib.sha256).hexdigest()
     headers["Authorization"] = (
-        f"SDK-HMAC-SHA256 Access={AK}, SignedHeaders={signed_headers}, Signature={signature}"
+        f"SDK-HMAC-SHA256 Access={creds['ak']}, SignedHeaders={signed_headers}, Signature={signature}"
     )
     return requests.request(
         method.upper(), url, data=body or None, headers=headers, timeout=30
@@ -146,6 +149,9 @@ def show_models() -> None:
 
 def main(argv: list) -> int:
     action = argv[1] if len(argv) > 1 else "default"
+    notice = credential_provider.token_notice(_current_creds())
+    if notice:
+        print("提示:", notice)
     try:
         if action == "status":
             show_status()
