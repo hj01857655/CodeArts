@@ -748,12 +748,17 @@ def _benefit_checkin_loop():
                         continue
                 except Exception:
                     pass  # 查不到状态就继续尝试领取
-                benefit.claim()
+                before = time.time()
+                claim_result = benefit.claim()
                 _last_checkin_date = today
                 info = benefit.balance()
                 total = info.get("total_quota") or 0
                 remain = info.get("total_balance") or 0
-                print(f"[签到] {today} 限时福利领取成功，余额 {remain:,}/{total:,}")
+                claim_ms = (claim_result or {}).get("create_time")
+                if claim_ms and claim_ms / 1000 < before - 10:
+                    print(f"[签到] {today} 当天已签到，余额 {remain:,}/{total:,}")
+                else:
+                    print(f"[签到] {today} 限时福利领取成功，余额 {remain:,}/{total:,}")
             except Exception as error:
                 print(f"[签到] {today} 限时福利领取失败: {error}")
         time.sleep(3600)
