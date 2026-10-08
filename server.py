@@ -770,9 +770,10 @@ if __name__ == "__main__":
         _load_model_cache()
     creds = _current_creds()
     if creds.get("token"):
-        print("凭证来源: CodeArts IDE 会话", credential_provider.token_notice(creds))
+        source = "auths 文件" if creds.get("_auth_file") else "CodeArts IDE 会话"
+        print(f"凭证来源: {source}", credential_provider.token_notice(creds))
     else:
-        print("凭证来源: 未找到 IDE 会话凭证，请在 CodeArts IDE 中登录")
+        print("凭证来源: 未找到凭证，请运行 python login.py 登录或在 CodeArts IDE 中登录")
     print(f"CodeArts OpenAI 兼容代理已启动: http://{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"OpenAI Base URL: http://{LISTEN_HOST}:{LISTEN_PORT}/v1")
     print("可用模型:", SUPPORTED_MODELS)
