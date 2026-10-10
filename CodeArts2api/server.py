@@ -843,6 +843,11 @@ def chat_completions():
         )
 
     if want_stream:
+        # generate() 是惰性生成器，迭代时请求上下文已结束，不能再碰 flask.g
+        # （否则抛 "Working outside of application context" → 客户端收到 HTML 500）。
+        # 请求期就把上下文字段抓成局部变量供生成器闭包使用。
+        rid, t0 = g.rid, g.t0
+
         def generate():
             """严格转发为 OpenAI SSE；仅对 benefit 流补齐缺失的结束原因。"""
             content_type = (upstream.headers.get("Content-Type") or "").lower()
@@ -889,7 +894,7 @@ def chat_completions():
                     if chunk.get("error_code") or chunk.get("error_msg"):
                         err_text = "%s %s" % (chunk.get("error_code") or "",
                                               chunk.get("error_msg") or "upstream error")
-                        logger.error("[%s] 流中上游错误帧: %s", g.rid, err_text)
+                        logger.error("[%s] 流中上游错误帧: %s", rid, err_text)
                         yield b"data: " + json.dumps(
                             {"error": {"message": err_text.strip(),
                                        "type": "upstream_error",
@@ -937,7 +942,7 @@ def chat_completions():
             if not is_benefit and not saw_done:
                 yield b"data: [DONE]\n\n"
 
-        resp = Response(_stream_log(generate(), g.rid, g.t0), status=200,
+        resp = Response(_stream_log(generate(), rid, t0), status=200,
                         mimetype="text/event-stream")
         resp.headers["Cache-Control"] = "no-cache, no-transform"
         resp.headers["Content-Type"] = "text/event-stream; charset=utf-8"
