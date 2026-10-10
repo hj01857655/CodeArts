@@ -204,6 +204,12 @@ python test_openai.py
 
 ## 说明
 
+- **流中错误帧显式暴露**（2026-10-11）：上游偶发在 2xx SSE 流里夹带错误帧
+  （如 `InferHub.001001005.400 The request param is invalid`）。此前流式路径裸透传，
+  Agent 客户端只看到空 delta → "no content and no tool calls" 无限重试。
+  现已改为：识别 `error_code`/`error_msg` 帧 → 转 OpenAI `{"error": {...}}` 帧
+  并终止流，客户端可直接看到真实原因。
+
 - 代理只做签名和转发，不修改模型行为。
 - 每次调用会消耗华为云 CodeArts 套餐额度（token）。
 - 仅绑定 `127.0.0.1`，不会对外网开放。

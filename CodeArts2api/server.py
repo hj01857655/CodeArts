@@ -27,6 +27,7 @@ from logging.handlers import RotatingFileHandler
 import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, g, jsonify, request
+from requests.adapters import HTTPAdapter
 
 import benefit
 import credential_provider
@@ -83,6 +84,12 @@ LISTEN_PORT = int(os.getenv("CODEARTS_PROXY_PORT", "8787"))
 API_KEY = os.getenv("API_KEY", "").strip()
 
 app = Flask(__name__)
+
+# 上游连接池：复用 TLS 连接，避免每次请求重新握手（对话与模型同步都走这里）
+_upstream = requests.Session()
+_adapter = HTTPAdapter(pool_connections=4, pool_maxsize=16, max_retries=0)
+_upstream.mount("https://", _adapter)
+_upstream.mount("http://", _adapter)
 
 # ── 请求日志（与 qoder2api 同一标准：request.log 轮转 + rid + in:/done: 双行）──
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "request.log")
@@ -263,7 +270,7 @@ def _signed_request(method: str, url: str, body: bytes = b"", extra_headers=None
         f"SDK-HMAC-SHA256 Access={creds['ak']}, SignedHeaders={signed_headers}, "
         f"Signature={signature}"
     )
-    return requests.request(
+    return _upstream.request(
         method.upper(), url, data=body or None, headers=headers, timeout=timeout
     )
 
@@ -497,8 +504,17 @@ def _refresh_models() -> bool:
         return False
 
 
+_refresh_trigger_lock = threading.Lock()
+_refresh_in_progress = False
+
+
 def _refresh_models_if_needed() -> None:
-    """模型列表短时缓存，避免 Cherry Studio 频繁轮询时重复请求。"""
+    """模型列表短时缓存，避免 Cherry Studio 频繁轮询时重复请求。
+
+    缓存过期时不再阻塞当前聊天请求：完全没有可用模型（首启动无缓存）才同步
+    刷新；否则触发后台刷新，当前请求沿用旧列表，避免上游变慢拖住对话。
+    """
+    global _refresh_in_progress
     # 进程刚启动时先把缓存详情装载到内存；不能只依赖兜底模型名。
     if not MODEL_DETAILS:
         _load_model_cache()
@@ -506,9 +522,25 @@ def _refresh_models_if_needed() -> None:
         age = time.time() - os.path.getmtime(MODEL_CACHE_PATH)
     except OSError:
         age = float("inf")
-    if age > 300:
+    if age <= 300:
+        return
+    if not SUPPORTED_MODELS:
         if not _refresh_models():
             _load_model_cache()
+        return
+    with _refresh_trigger_lock:
+        if _refresh_in_progress:
+            return
+        _refresh_in_progress = True
+
+    def _background_refresh():
+        global _refresh_in_progress
+        try:
+            _refresh_models()
+        finally:
+            _refresh_in_progress = False
+
+    threading.Thread(target=_background_refresh, daemon=True, name="model-refresh").start()
 
 
 def _normalize_finish_reason(value):
@@ -755,7 +787,7 @@ def chat_completions():
     attempt = 0
     while True:
         try:
-            upstream = requests.post(
+            upstream = _upstream.post(
                 TARGET, data=body, headers=headers, stream=True, timeout=(10, 600)
             )
         except Exception as e:
@@ -850,6 +882,23 @@ def chat_completions():
                     continue
                 try:
                     chunk = json.loads(payload.decode("utf-8"))
+                    # 上游错误帧（如 InferHub.001001005.400 param invalid）：
+                    # 原样透传会被 Agent Runtime 当成空响应 → "no content and no
+                    # tool calls" 无限重试。转成 OpenAI error 帧并终止流，让
+                    # 客户端直接看到真实原因。
+                    if chunk.get("error_code") or chunk.get("error_msg"):
+                        err_text = "%s %s" % (chunk.get("error_code") or "",
+                                              chunk.get("error_msg") or "upstream error")
+                        logger.error("[%s] 流中上游错误帧: %s", g.rid, err_text)
+                        yield b"data: " + json.dumps(
+                            {"error": {"message": err_text.strip(),
+                                       "type": "upstream_error",
+                                       "code": chunk.get("error_code")}},
+                            ensure_ascii=False, separators=(",", ":")
+                        ).encode("utf-8") + b"\n\n"
+                        yield b"data: [DONE]\n\n"
+                        saw_done = True
+                        return
                     for choice in chunk.get("choices") or []:
                         reason = choice.get("finish_reason")
                         if reason is not None:
@@ -910,6 +959,24 @@ def chat_completions():
     output = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     resp = Response(output, status=200, content_type="application/json; charset=utf-8")
     return _cors(resp)
+
+
+# ── 积分余额（snap-access 网关，agent 通道模型消耗）──────────────────────
+_credit_cache = {"at": 0.0, "data": None}
+
+
+def _credit_balance_cached(max_age: int = 60) -> dict:
+    """积分余额短缓存；面板刷新不必每次打上游。"""
+    now = time.time()
+    if _credit_cache["data"] is None or now - _credit_cache["at"] > max_age:
+        try:
+            _credit_cache["data"] = benefit.credit_balance()
+        except Exception as error:
+            logger.warning("积分余额查询失败: %s", error)
+            if _credit_cache["data"] is None:
+                _credit_cache["data"] = {}
+        _credit_cache["at"] = now
+    return _credit_cache["data"]
 
 
 # ── 管理面板 ──────────────────────────────────────────────────────────
@@ -978,6 +1045,12 @@ def admin_overview():
         benefit_info.update(bal)
     except Exception:
         pass
+    # 积分通道（snap-access 网关）与福利额度同属 benefit，一并返回
+    credits = _credit_balance_cached()
+    if credits:
+        benefit_info["credit_total"] = credits.get("total")
+        benefit_info["credit_used"] = credits.get("used")
+        benefit_info["credit_remain"] = credits.get("remain")
     return jsonify({
         "service": "CodeArts2api",
         "credential": cred_info,
@@ -993,10 +1066,20 @@ def admin_checkin():
         return _cors(Response(""))
     try:
         benefit.claim()
+        messages = []
         bal = benefit.balance()
         remain = bal.get("total_balance") or 0
         total = bal.get("total_quota") or 0
-        return jsonify({"ok": True, "message": f"签到成功，余额 {remain:,}/{total:,}"})
+        messages.append(f"Token {remain:,}/{total:,}")
+        try:
+            credit_status = benefit.do_credit_claim()
+            _credit_cache["at"] = 0.0
+            credits = benefit.credit_balance()
+            if credits:
+                messages.append(f"积分 {credits.get('remain'):,}/{credits.get('total'):,}（{credit_status}）")
+        except Exception as credit_error:
+            logger.warning("积分领取失败（不影响 Token 签到）: %s", credit_error)
+        return jsonify({"ok": True, "message": "签到成功：" + "，".join(messages)})
     except Exception as e:
         return jsonify({"ok": False, "message": f"签到失败: {e}"}), 500
 
@@ -1041,10 +1124,20 @@ def _benefit_checkin_loop():
                 total = info.get("total_quota") or 0
                 remain = info.get("total_balance") or 0
                 claim_ms = (claim_result or {}).get("create_time")
+                # 积分通道（每日 1000 积分，agent 模型消耗）与福利同一条日志汇报，幂等安全
+                credit_text = ""
+                try:
+                    credit_status = benefit.do_credit_claim()
+                    _credit_cache["at"] = 0.0
+                    credits = benefit.credit_balance()
+                    if credits:
+                        credit_text = f"，积分 {credits.get('remain'):,}/{credits.get('total'):,}（{credit_status}）"
+                except Exception as credit_error:
+                    credit_text = f"，积分查询失败: {credit_error}"
                 if claim_ms and claim_ms / 1000 < before - 10:
-                    print(f"[签到] {today} 当天已签到，余额 {remain:,}/{total:,}")
+                    print(f"[签到] {today} 当天已签到，Token {remain:,}/{total:,}{credit_text}")
                 else:
-                    print(f"[签到] {today} 限时福利领取成功，余额 {remain:,}/{total:,}")
+                    print(f"[签到] {today} 福利领取成功，Token {remain:,}/{total:,}{credit_text}")
             except Exception as error:
                 print(f"[签到] {today} 限时福利领取失败: {error}")
         time.sleep(3600)
