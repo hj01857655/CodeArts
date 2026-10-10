@@ -739,6 +739,75 @@ def get_model(model_id):
     return jsonify(_model_payload(model_id))
 
 
+def _sanitize_tool_calls(req_json: dict) -> None:
+    """清洗 messages 里悬空的 tool_calls / 孤儿 tool 消息（原地修改 req_json）。
+
+    上游对结构校验比 OpenAI 严格：assistant 带 tool_calls 后必须紧跟对应
+    tool_call_id 的 tool 消息，缺一个就报
+    InferHub.malformed_json.400 "insufficient tool messages following tool_calls message"。
+
+    客户端被中断时最容易留下这种悬空结构（assistant 发起工具调用但结果没落地），
+    下一请求整条历史都会被拒。处理原则：只动消息结构，绝不碰 function.name 等字段名。
+    """
+    msgs = req_json.get("messages")
+    if not isinstance(msgs, list):
+        return
+
+    # tool_call_id -> 是否有对应的 tool 回复消息
+    answered = {
+        m.get("tool_call_id")
+        for m in msgs
+        if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id")
+    }
+
+    # tool_call_id -> 对应的 assistant 调用是否存在（用于识别孤儿 tool 消息）
+    called = set()
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    called.add(tc["id"])
+
+    out = []
+    dropped_assistant = 0
+    stripped_assistant = 0
+    dropped_tool = 0
+    for m in msgs:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+
+        if m.get("role") == "tool":
+            # 找不到对应 assistant 调用的 tool 消息：上游同样会拒
+            if m.get("tool_call_id") not in called:
+                dropped_tool += 1
+                continue
+            out.append(m)
+            continue
+
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            dangling = [tc for tc in m["tool_calls"]
+                        if isinstance(tc, dict) and tc.get("id") not in answered]
+            if dangling:
+                if m.get("content"):
+                    # 有文本：只摘掉悬空 tool_calls，保留这段 assistant 内容
+                    m = {k: v for k, v in m.items() if k != "tool_calls"}
+                    stripped_assistant += 1
+                else:
+                    # 无内容：整条丢弃，否则留下一个空 assistant
+                    dropped_assistant += 1
+                    continue
+        out.append(m)
+
+    fixed = dropped_assistant + stripped_assistant + dropped_tool
+    if fixed:
+        req_json["messages"] = out
+        logger.warning(
+            "[%s] 清洗悬空 tool 结构: 丢弃 assistant=%d 摘除 tool_calls=%d 丢弃 tool=%d，"
+            "msgs %d→%d", g.rid, dropped_assistant, stripped_assistant, dropped_tool,
+            len(msgs), len(out))
+
+
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def chat_completions():
     if request.method == "OPTIONS":
@@ -751,6 +820,9 @@ def chat_completions():
         req_json = json.loads(body)
     except Exception:
         return _cors(jsonify({"error": {"message": "invalid JSON body"}})), 400
+
+    # 清洗悬空 tool_calls / 孤儿 tool 消息（客户端中断后上游会拒整条历史）
+    _sanitize_tool_calls(req_json)
 
     # 模型名归一化；请求聊天时也按短缓存周期同步一次模型列表
     _refresh_models_if_needed()
