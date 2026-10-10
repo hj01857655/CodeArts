@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>CodeArts2API · 控制台</title>
+<style>
+:root{
+  --bg:#EEF2F8; --card:rgba(255,255,255,.66); --card2:rgba(255,255,255,.88);
+  --line:rgba(100,116,139,.42); --text:#1E293B; --muted:#55657E; --accent:#0284c7;
+  --ok:#16a34a; --warn:#d97706; --bad:#dc2626; --info:#0284c7;
+  --radius:16px; --radius-sm:10px;
+  --shadow:0 8px 24px rgba(30,41,59,.08), inset 0 1px 0 rgba(255,255,255,.95);
+  --shadow-lg:0 16px 40px rgba(30,41,59,.14), inset 0 1px 0 rgba(255,255,255,.95);
+  --blur:14px;
+  --font-sans:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,'Courier New',monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;color:var(--text);font:14px/1.55 var(--font-sans);-webkit-font-smoothing:antialiased;
+  background:
+    radial-gradient(900px 480px at 8% -8%, rgba(191,219,254,.55), transparent),
+    radial-gradient(820px 440px at 96% 2%, rgba(221,214,254,.5), transparent),
+    radial-gradient(760px 420px at 55% 112%, rgba(165,243,252,.42), transparent),
+    linear-gradient(180deg,#F6F8FC,#ECF1F8)}
+button{font:inherit;cursor:pointer}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:8px}
+::selection{background:color-mix(in srgb,var(--accent) 28%,transparent)}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:rgba(100,116,139,.35);border-radius:99px}
+::-webkit-scrollbar-track{background:transparent}
+.wrap{max-width:1080px;margin:0 auto;padding:26px 18px 52px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:22px}
+.brand{display:flex;align-items:center;gap:13px}
+.logo{width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 55%,#fff));display:grid;place-items:center;font-weight:800;color:#fff;box-shadow:var(--shadow);font-family:var(--font-mono);letter-spacing:-.5px}
+.brand h1{margin:0;font-size:20px;letter-spacing:.2px;font-weight:600;color:#0F172A}
+.brand p{margin:2px 0 0;color:var(--muted);font-size:12px}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn{border:1px solid var(--line);background:rgba(255,255,255,.75);color:#334155;padding:8px 13px;border-radius:var(--radius-sm);cursor:pointer;transition:border-color .18s,background .18s,transform .12s,box-shadow .18s;box-shadow:0 2px 8px rgba(30,41,59,.05)}
+.btn:hover{border-color:color-mix(in srgb,var(--accent) 55%,var(--line));background:#fff;transform:translateY(-1px);box-shadow:var(--shadow)}
+.btn:active{transform:translateY(0)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn.primary{background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 78%,#fff));border-color:transparent;color:#fff;font-weight:700;box-shadow:0 4px 16px color-mix(in srgb,var(--accent) 32%,transparent)}
+.btn.primary:hover{filter:brightness(1.05);box-shadow:0 6px 20px color-mix(in srgb,var(--accent) 42%,transparent)}
+.btn.ghost{background:transparent;box-shadow:none}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}
+@media (max-width:900px){.grid{grid-template-columns:1fr}}
+.stat{position:relative;overflow:hidden;background:var(--card);border:1px solid rgba(255,255,255,.8);border-radius:var(--radius);padding:15px 16px 13px;box-shadow:var(--shadow);backdrop-filter:blur(var(--blur));-webkit-backdrop-filter:blur(var(--blur))}
+.stat::before{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:linear-gradient(180deg,var(--accent),transparent);border-radius:4px}
+.stat .k{color:var(--muted);font-size:12px;font-weight:600}
+.stat .v{font-size:22px;font-weight:700;margin-top:5px;letter-spacing:-.5px;font-variant-numeric:tabular-nums;line-height:1.1;color:#0F172A}
+.stat .sub{font-size:11px;color:var(--muted);margin-top:3px}
+.card{background:var(--card);border:1px solid rgba(255,255,255,.85);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden;margin-bottom:16px;backdrop-filter:blur(var(--blur));-webkit-backdrop-filter:blur(var(--blur))}
+.card-h{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.35)}
+.card-h h2{margin:0;font-size:15px;font-weight:600;color:#0F172A}
+.card-b{padding:12px 16px}
+.kv{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(100,116,139,.15)}
+.kv:last-child{border-bottom:none}
+.kv .k{color:var(--muted);font-size:13px}
+.kv .v{font-weight:600;font-variant-numeric:tabular-nums}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:700;border:1px solid transparent}
+.badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.badge.ok{background:rgba(22,163,74,.12);color:#15803d;border-color:rgba(22,163,74,.3)}
+.badge.warn{background:rgba(217,119,6,.12);color:#b45309;border-color:rgba(217,119,6,.3)}
+.badge.bad{background:rgba(220,38,38,.1);color:#b91c1c;border-color:rgba(220,38,38,.28)}
+.badge.info{background:rgba(2,132,199,.1);color:#0369a1;border-color:rgba(2,132,199,.28)}
+.mono{font-family:var(--font-mono);font-size:12px}
+.muted{color:var(--muted)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{background:rgba(255,255,255,.8);border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:12px;color:var(--muted);font-family:var(--font-mono)}
+.chip.benefit{border-color:rgba(2,132,199,.3);color:#0369a1;background:rgba(2,132,199,.06)}
+.chip.agent{border-color:rgba(22,163,74,.25);color:#15803d;background:rgba(22,163,74,.05)}
+.toast{position:fixed;right:16px;bottom:16px;max-width:420px;background:rgba(255,255,255,.92);border:1px solid rgba(255,255,255,.9);color:var(--text);padding:12px 15px;border-radius:var(--radius-sm);box-shadow:var(--shadow-lg);opacity:0;transform:translateY(8px);transition:.22s;z-index:50;pointer-events:none;font-size:13px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.toast.show{opacity:1;transform:none}
+.foot{margin-top:10px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid color-mix(in srgb,var(--accent) 30%,transparent);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-1px;margin-right:6px}
+@keyframes sp{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.btn:hover{transform:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand">
+      <div class="logo">CA</div>
+      <div>
+        <h1>CodeArts2API</h1>
+        <p id="subTitle">凭证 · 福利 · 模型</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn primary" id="btnCheckin">签到领取</button>
+      <button class="btn" id="btnRefresh">刷新状态</button>
+      <button class="btn" id="btnReloadModels">重载模型</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="stat">
+      <div class="k">凭证状态</div>
+      <div class="v" id="sCredStatus">—</div>
+      <div class="sub" id="sCredSource"></div>
+    </div>
+    <div class="stat">
+      <div class="k">福利余额</div>
+      <div class="v" id="sBalance">—</div>
+      <div class="sub" id="sBalanceDetail"></div>
+    </div>
+    <div class="stat">
+      <div class="k">可用模型</div>
+      <div class="v" id="sModels">—</div>
+      <div class="sub" id="sModelsDetail"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>凭证详情</h2><span class="muted mono" id="updatedAt"></span></div>
+    <div class="card-b">
+      <div class="kv"><span class="k">来源</span><span class="v" id="credSource">—</span></div>
+      <div class="kv"><span class="k">AccessKey</span><span class="v mono" id="credAk">—</span></div>
+      <div class="kv"><span class="k">过期时间</span><span class="v mono" id="credExpiry">—</span></div>
+      <div class="kv"><span class="k">剩余有效期</span><span class="v" id="credRemain">—</span></div>
+      <div class="kv"><span class="k">提示</span><span class="v muted" id="credNotice">—</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>福利签到</h2><span class="badge info" id="checkinBadge">未签到</span></div>
+    <div class="card-b">
+      <div class="kv"><span class="k">最近签到</span><span class="v mono" id="lastCheckin">—</span></div>
+      <div class="kv"><span class="k">总额度</span><span class="v" id="totalQuota">—</span></div>
+      <div class="kv"><span class="k">已使用</span><span class="v" id="usedAmount">—</span></div>
+      <div class="kv"><span class="k">剩余</span><span class="v" id="remainAmount">—</span></div>
+      <div class="kv"><span class="k">自动签到</span><span class="v" id="autoCheckin">—</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>模型列表</h2><span class="muted" id="modelCount"></span></div>
+    <div class="card-b"><div class="chips" id="modelChips"></div></div>
+  </div>
+
+  <div class="foot">
+    <span>OpenAI Base URL: <span class="mono" id="baseUrl"></span></span>
+    <span>API: <span class="mono">/v1/chat/completions</span></span>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function toast(msg, ok=true){
+  const t = $("toast");
+  t.textContent = msg;
+  t.style.borderColor = ok ? "rgba(34,197,94,.4)" : "rgba(239,68,68,.45)";
+  t.classList.add("show");
+  clearTimeout(t._tm);
+  t._tm = setTimeout(()=>t.classList.remove("show"), 3200);
+}
+
+function escapeHtml(s){
+  return String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+function fmtTime(t){
+  if (!t || t === "0001-01-01T00:00:00Z") return "—";
+  try {
+    const d = new Date(t);
+    if (isNaN(d.getTime())) return t;
+    return d.toLocaleString("zh-CN");
+  } catch { return t; }
+}
+
+function fmtNum(n){
+  if (n === null || n === undefined) return "—";
+  return Number(n).toLocaleString();
+}
+
+async function api(path, opts={}){
+  const headers = Object.assign({"Content-Type":"application/json"}, opts.headers||{});
+  if (window.__API_KEY__) headers["Authorization"] = "Bearer " + window.__API_KEY__;
+  const res = await fetch(path, Object.assign({}, opts, {headers}));
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = {raw:text}; }
+  if (!res.ok){
+    const msg = (data && (data.error?.message || data.message || data.error)) || text || res.statusText;
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+  }
+  return data;
+}
+
+function credBadge(valid, notice){
+  if (!valid) return '<span class="badge bad">失效</span>';
+  if (notice && notice.includes("即将过期")) return '<span class="badge warn">即将过期</span>';
+  return '<span class="badge ok">有效</span>';
+}
+
+function render(data){
+  const cred = data.credential || {};
+  const benefit = data.benefit || {};
+  const models = data.models || [];
+  const sched = data.schedule || {};
+
+  // 顶部统计卡
+  const valid = !!cred.valid;
+  $("sCredStatus").innerHTML = credBadge(valid, cred.notice);
+  $("sCredSource").textContent = cred.source || "—";
+
+  const remain = benefit.total_balance ?? 0;
+  const total = benefit.total_quota ?? 0;
+  $("sBalance").textContent = total ? `${fmtNum(remain)}/${fmtNum(total)}` : "—";
+  $("sBalanceDetail").textContent = total ? `${((remain/total)*100).toFixed(1)}% 剩余` : "";
+
+  $("sModels").textContent = models.length;
+  const agentCount = models.filter(m => m.channel === "agent").length;
+  const benefitCount = models.filter(m => m.channel === "benefit").length;
+  $("sModelsDetail").textContent = `${agentCount} 老套餐 / ${benefitCount} 免费额度`;
+
+  // 凭证详情
+  $("credSource").textContent = cred.source || "—";
+  $("credAk").textContent = cred.ak ? cred.ak.slice(0,8) + "…" + cred.ak.slice(-4) : "—";
+  $("credExpiry").textContent = fmtTime(cred.expires_at);
+  $("credRemain").textContent = cred.remain_text || "—";
+  $("credNotice").textContent = cred.notice || "—";
+  $("updatedAt").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN");
+
+  // 福利签到
+  const lastCheckin = benefit.last_checkin;
+  $("lastCheckin").textContent = lastCheckin ? fmtTime(lastCheckin) : "从未签到";
+  $("totalQuota").textContent = fmtNum(benefit.total_quota);
+  $("usedAmount").textContent = fmtNum(benefit.used_amount);
+  $("remainAmount").textContent = fmtNum(benefit.total_balance);
+  $("autoCheckin").textContent = sched.auto_checkin ? "已开启" : "已关闭";
+  $("autoCheckin").className = "v" + (sched.auto_checkin ? "" : " muted");
+
+  // 签到 badge
+  if (lastCheckin){
+    const today = new Date().toDateString();
+    const checkinDate = new Date(lastCheckin).toDateString();
+    $("checkinBadge").className = "badge " + (checkinDate === today ? "ok" : "warn");
+    $("checkinBadge").textContent = checkinDate === today ? "今日已签" : "今日未签";
+  } else {
+    $("checkinBadge").className = "badge bad";
+    $("checkinBadge").textContent = "从未签到";
+  }
+
+  // 模型列表
+  $("modelCount").textContent = models.length + " 个";
+  $("modelChips").innerHTML = models.length
+    ? models.map(m => `<span class="chip mono ${m.channel||""}">${escapeHtml(m.id)}</span>`).join("")
+    : `<span class="muted">暂无模型</span>`;
+
+  // 底部
+  $("baseUrl").textContent = location.origin + "/v1";
+  $("subTitle").textContent = "凭证 · 福利 · 模型";
+}
+
+async function loadOverview(){
+  const data = await api("/admin/api/overview");
+  render(data);
+  return data;
+}
+
+$("btnRefresh").onclick = async () => {
+  try { await loadOverview(); toast("已刷新"); } catch(e){ toast(e.message, false); }
+};
+
+$("btnCheckin").onclick = async () => {
+  $("btnCheckin").disabled = true;
+  try {
+    const data = await api("/admin/api/checkin", {method:"POST", body:"{}"});
+    toast(data.message || "签到成功");
+    await loadOverview();
+  } catch(e){
+    toast("签到失败: " + e.message, false);
+  } finally {
+    $("btnCheckin").disabled = false;
+  }
+};
+
+$("btnReloadModels").onclick = async () => {
+  $("btnReloadModels").disabled = true;
+  try {
+    const data = await api("/admin/api/reload-models", {method:"POST", body:"{}"});
+    toast(data.message || "模型已重载");
+    await loadOverview();
+  } catch(e){
+    toast("重载失败: " + e.message, false);
+  } finally {
+    $("btnReloadModels").disabled = false;
+  }
+};
+
+// 初始加载
+loadOverview().catch(e => toast("加载失败: " + e.message, false));
+</script>
+</body>
+</html>

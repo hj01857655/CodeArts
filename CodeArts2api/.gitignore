@@ -1,0 +1,12 @@
+__pycache__
+auths/
+.env
+.breezell/
+request.log*
+dumps/
+models-cache.json
+credentials.json
+credentials.json.tmp
+__pycache__/
+*.pyc
+benefit.log
