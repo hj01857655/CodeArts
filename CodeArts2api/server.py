@@ -65,6 +65,16 @@ UPSTREAM_RETRY_CODES = {"TM.00001041"}
 UPSTREAM_RETRY_MAX = 3
 UPSTREAM_RETRY_BACKOFF = 2.0
 UPSTREAM_CREDIT_CODES = {"TM.00001050"}
+# 上游网关偶发 TLS 中断（SSLEOFError: UNEXPECTED_EOF_WHILE_READING）与连接重置。
+# 代理在拿到响应之前重发是安全的，客户端本身也会重发整条请求，有界重试只是把
+# 这次重发收在代理里，省掉一次客户端往返和一整轮 502。
+CONN_RETRY_MAX = int(os.getenv("CODEARTS_CONN_RETRY_MAX", "2"))
+CONN_RETRY_BACKOFF = float(os.getenv("CODEARTS_CONN_RETRY_BACKOFF", "0.5"))
+# 上游 InferHub 对 max_tokens 有硬上限（实测 65536 通过、66560 起整请求被拒，
+# 报流内错误帧 InferHub.001001005.400 "The request param is invalid"）。
+# 而 AgentCenter/opengw 下发的 model_parameters.max_tokens 是上下文口径的值
+# （131072 起），客户端读到后照抄发送必然全量失败，因此入站钳到该上限。
+MAX_TOKENS_CAP = int(os.getenv("CODEARTS_MAX_TOKENS_CAP", "65536"))
 # 模型缓存与代理程序放在同一目录，便于迁移、备份和排查
 MODEL_CACHE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "models-cache.json"
@@ -226,8 +236,22 @@ def _stream_log(gen, rid, t0):
         raise
 
 
+def _is_conn_retryable(error: BaseException) -> bool:
+    """连接级失败可以在代理侧重发；读超时不行。
+
+    可重发：TLS 被中断（SSLEOFError）、连接被重置、连不上。这些情况下代理一个
+    响应字节都没拿到，重发最多是让上游多做一次它本来也会替客户端做的事。
+    不可重发：读超时——请求已经进入推理阶段，重发会把同一次生成再算一遍。
+    """
+    if isinstance(error, requests.exceptions.ConnectTimeout):
+        return True
+    if isinstance(error, requests.exceptions.Timeout):
+        return False
+    return isinstance(error, requests.exceptions.ConnectionError)
+
+
 def _signed_request(method: str, url: str, body: bytes = b"", extra_headers=None, timeout=30):
-    """发送带华为云 SDK-HMAC-SHA256 签名的请求。"""
+    """发送带华为云 SDK-HMAC-SHA256 签名的请求，连接级失败时换新连接重发。"""
     creds = _current_creds()
     parsed = urllib.parse.urlparse(url)
     path = parsed.path or "/"
@@ -244,35 +268,51 @@ def _signed_request(method: str, url: str, body: bytes = b"", extra_headers=None
         headers[key.lower()] = str(value)
     headers["host"] = parsed.netloc
     headers.setdefault("content-type", "application/json")
-    sdk_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    headers["x-sdk-date"] = sdk_date
     if creds.get("token"):
         headers["x-security-token"] = creds["token"]
+    # 先占位：x-sdk-date 必须进 SignedHeaders，否则签名与规范头不匹配（上游 401）
+    headers["x-sdk-date"] = ""
 
     signed_names = sorted(headers)
-    canonical_headers = "".join(
-        f"{name}:{headers[name].strip()}\n" for name in signed_names
-    )
     signed_headers = ";".join(signed_names)
     payload_hash = hashlib.sha256(body).hexdigest()
-    canonical_request = (
-        f"{method.upper()}\n{canonical_uri}\n{canonical_query}\n"
-        f"{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    )
-    string_to_sign = (
-        f"SDK-HMAC-SHA256\n{sdk_date}\n"
-        f"{hashlib.sha256(canonical_request.encode()).hexdigest()}"
-    )
-    signature = hmac.new(
-        creds["sk"].encode(), string_to_sign.encode(), hashlib.sha256
-    ).hexdigest()
-    headers["authorization"] = (
-        f"SDK-HMAC-SHA256 Access={creds['ak']}, SignedHeaders={signed_headers}, "
-        f"Signature={signature}"
-    )
-    return _upstream.request(
-        method.upper(), url, data=body or None, headers=headers, timeout=timeout
-    )
+
+    # x-sdk-date 参与签名，且时间戳超出允许的时钟偏差会被拒，所以每次重发都重新签一遍
+    for attempt in range(CONN_RETRY_MAX + 1):
+        sdk_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        headers["x-sdk-date"] = sdk_date
+        canonical_headers = "".join(
+            f"{name}:{headers[name].strip()}\n" for name in signed_names
+        )
+        canonical_request = (
+            f"{method.upper()}\n{canonical_uri}\n{canonical_query}\n"
+            f"{canonical_headers}\n{signed_headers}\n{payload_hash}"
+        )
+        string_to_sign = (
+            f"SDK-HMAC-SHA256\n{sdk_date}\n"
+            f"{hashlib.sha256(canonical_request.encode()).hexdigest()}"
+        )
+        signature = hmac.new(
+            creds["sk"].encode(), string_to_sign.encode(), hashlib.sha256
+        ).hexdigest()
+        headers["authorization"] = (
+            f"SDK-HMAC-SHA256 Access={creds['ak']}, SignedHeaders={signed_headers}, "
+            f"Signature={signature}"
+        )
+        try:
+            return _upstream.request(
+                method.upper(), url, data=body or None, headers=headers, timeout=timeout
+            )
+        except Exception as error:
+            if attempt < CONN_RETRY_MAX and _is_conn_retryable(error):
+                delay = CONN_RETRY_BACKOFF * (attempt + 1)
+                logger.warning(
+                    "[重试] %s %s 连接级失败（%s），%.1fs 后第 %d/%d 次重发",
+                    method.upper(), parsed.netloc, type(error).__name__,
+                    delay, attempt + 1, CONN_RETRY_MAX)
+                time.sleep(delay)
+                continue
+            raise
 
 
 def _hmac_headers(body: bytes, benefit: bool = False, model_id: str = "") -> dict:
@@ -672,11 +712,37 @@ def after_request(resp: Response) -> Response:
     return _cors(resp)
 
 
+def _capped_max_tokens(value):
+    """把云端下发的输出上限收敛到上游实际接受的值；非数值原样返回。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    return min(int(value), MAX_TOKENS_CAP)
+
+
+def _clamp_max_tokens(req_json: dict) -> None:
+    """把客户端要的输出上限钳到上游接受的范围（原地修改 req_json）。
+
+    超出时 InferHub 不返回 4xx，而是在已建立的流里塞一个
+    InferHub.001001005.400 错误帧，Agent Runtime 会当成空响应无限重试；
+    所以必须在转发前修正，不能透传报错。
+    """
+    for field in ("max_tokens", "max_completion_tokens"):
+        value = req_json.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if value > MAX_TOKENS_CAP:
+            req_json[field] = MAX_TOKENS_CAP
+            logger.warning("[%s] %s %d→%d：超过上游上限，超出部分会被 InferHub 判为非法参数",
+                           g.rid, field, int(value), MAX_TOKENS_CAP)
+
+
 def _model_payload(model_id: str) -> dict:
     """生成 OpenAI 模型对象，并附带常见能力元数据。"""
     detail = MODEL_DETAILS.get(model_id, {})
     context_window = detail.get("context_window")
-    max_tokens = detail.get("max_tokens")
+    # 对外上报的输出上限必须是上游真正接受的值，否则客户端会按云端下发的
+    # 上下文口径值（131072+）发请求，直接被 InferHub 判为非法参数。
+    max_tokens = _capped_max_tokens(detail.get("max_tokens"))
     supports_images = bool(detail.get("supports_images", False))
     payload = {
         "id": model_id,
@@ -844,6 +910,8 @@ def chat_completions():
             404,
         )
     req_json["model"] = model
+    # 输出上限必须在签名前收敛：签名覆盖 body 哈希，钳制必须在重序列化之前完成
+    _clamp_max_tokens(req_json)
 
     # 通道判断：AgentCenter 老套餐模型用基础签名；其余（免费 benefit 模型）
     # 必须带 maas_type/model-id/model-name 三个签名头，否则上游报未注册。
@@ -854,15 +922,25 @@ def chat_completions():
 
     # 重新序列化 body（确保与签名时一致）
     body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
-    headers = _hmac_headers(body, benefit=benefit, model_id=model)
 
     attempt = 0
+    conn_attempt = 0
     while True:
+        # x-sdk-date 参与签名，每次重发都要重新签一遍，避免复用旧时间戳
+        headers = _hmac_headers(body, benefit=benefit, model_id=model)
         try:
             upstream = _upstream.post(
                 TARGET, data=body, headers=headers, stream=True, timeout=(10, 600)
             )
         except Exception as e:
+            # TLS 中断/连接重置：一个响应字节都没拿到，换新连接重发
+            if conn_attempt < CONN_RETRY_MAX and _is_conn_retryable(e):
+                conn_attempt += 1
+                delay = CONN_RETRY_BACKOFF * conn_attempt
+                logger.warning("[%s] [重试] 上游连接级失败（%s），%.1fs 后第 %d/%d 次重发",
+                               g.rid, type(e).__name__, delay, conn_attempt, CONN_RETRY_MAX)
+                time.sleep(delay)
+                continue
             logger.error("[%s] 上游请求异常: %s", g.rid, e)
             return _cors(jsonify({"error": {"message": f"upstream error: {e}"}})), 502
 

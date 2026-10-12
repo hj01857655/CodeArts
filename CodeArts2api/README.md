@@ -149,14 +149,19 @@ CODEARTS_BENEFIT_AUTO_CLAIM=0
 
 ### 免费模型
 
-| 模型 | 上下文窗口 | 最大输出 | 通道 |
-|---|---|---|---|
-| `deepseek-v4-flash-0731` | 1,048,576 | 393,216 | Token |
-| `glm-5.3-flash` | 1,048,576 | 131,072 | Token |
-| `deepseek-v4-pro-0813` | 1,000,000 | 393,216 | Token |
-| `deepseek-v4.1-flash` | 1,000,000 | 384,000 | Token |
-| `GLM-5.2` | 202,752 | 131,072 | 积分 |
-| `glm-5.2-sft-harmony` | 202,752 | 131,072 | 积分 |
+| 模型 | 上下文窗口 | 云端下发 max_tokens | 上游实际接受上限 | 通道 |
+|---|---|---|---|---|
+| `deepseek-v4-flash-0731` | 1,048,576 | 393,216 | ≤65,536（131,072 实测被拒） | Token |
+| `glm-5.3-flash` | 1,048,576 | 131,072 | 65,536 | Token |
+| `deepseek-v4-pro-0813` | 1,000,000 | 393,216 | ≤65,536（未逐模型二分） | Token |
+| `deepseek-v4.1-flash` | 1,000,000 | 384,000 | ≤65,536（未逐模型二分） | Token |
+| `GLM-5.2` | 202,752 | 131,072 | 65,536（66,560 起报 `InferHub.001001005.400`） | 积分 |
+| `glm-5.2-sft-harmony` | 202,752 | 131,072 | 65,536 | 积分 |
+
+> 云端下发的 `max_tokens` 是上下文口径的值，直接当输出上限发给 InferHub 会整请求被拒，
+> 且拒绝以流内错误帧的形式返回（HTTP 仍是 200），Agent 类客户端会当成空响应反复重试。
+> `server.py` 因此把入站 `max_tokens` 钳到 `CODEARTS_MAX_TOKENS_CAP`（默认 65,536），
+> `/v1/models` 也按钳制后的值上报，避免客户端照着 131,072 设值。
 
 ---
 
@@ -174,6 +179,9 @@ CODEARTS_BENEFIT_AUTO_CLAIM=0
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `CODEARTS_BENEFIT_AUTO_CLAIM` | `1` | 免费额度自动领取与每日签到开关 |
+| `CODEARTS_MAX_TOKENS_CAP` | `65536` | 入站 `max_tokens` 钳制上限（上游 InferHub 实际接受的输出上限） |
+| `CODEARTS_CONN_RETRY_MAX` | `2` | 拿到响应前的连接级失败（TLS 中断/连接重置）重发次数 |
+| `CODEARTS_CONN_RETRY_BACKOFF` | `0.5` | 上述重发的退避基数（秒，第 n 次等 n×基数） |
 
 ---
 
@@ -188,7 +196,8 @@ CodeArts2api/
 ├── auths/                  # OAuth 凭证存储（gitignore，勿提交）
 ├── models-cache.json       # 模型列表缓存
 ├── requirements.txt        # Python 依赖
-├── test_openai.py          # 本地测试脚本
+├── test_openai.py          # 本地测试脚本（需 server 在跑，会真实打上游）
+├── test_upstream_offline.py # 离线单测：假上游，不联网、不写 request.log
 └── README.md
 ```
 
@@ -197,12 +206,28 @@ CodeArts2api/
 ## 本地测试
 
 ```cmd
-python test_openai.py
+python test_upstream_offline.py   # 离线单测：不打上游，可随时跑
+python test_openai.py             # 端到端：需 server 已在 8787 运行，会真实消耗额度
 ```
+
+离线单测用假 `_upstream` / 假 `_hmac_headers` 覆盖：连接级重发次数与重新签名、读超时不重发、
+max_tokens 钳制、正常路径不受影响，以及 `_signed_request` 的规范串与独立实现逐字节一致。
 
 ---
 
 ## 说明
+
+- **`max_tokens` 入站钳制**（2026-10-12）：上游 InferHub 实际只接受 `max_tokens ≤ 65536`
+  （实测 65536 通过、66560 起整请求被拒），而云端下发的 `model_parameters.max_tokens`
+  是上下文口径的 131072+。客户端照它设值时，上游不返回 4xx，而是在已建立的 SSE 流里
+  塞 `InferHub.001001005.400` 错误帧，Agent 客户端按空响应无限重试。现改为转发前钳到
+  `CODEARTS_MAX_TOKENS_CAP`，`/v1/models` 也按钳制后的值上报。
+
+- **连接级失败有界重发**（2026-10-12）：上游网关会偶发 TLS 中断
+  （`SSLEOFError: UNEXPECTED_EOF_WHILE_READING`）与连接重置，此前 `max_retries=0`
+  直接把 502 抛给客户端。现在对「一个响应字节都没拿到」的失败重签后重发
+  （默认 2 次）；读超时不重发，避免上游已在推理时重复计费。urllib3 在 TLS 报错时会
+  丢弃该连接，所以重发一定走新连接。
 
 - **流中错误帧显式暴露**（2026-10-11）：上游偶发在 2xx SSE 流里夹带错误帧
   （如 `InferHub.001001005.400 The request param is invalid`）。此前流式路径裸透传，
