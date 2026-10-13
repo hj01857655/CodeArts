@@ -281,6 +281,93 @@ check("T8 x-security-token 在 SignedHeaders 内",
 check("T8 签名与独立实现的规范串一致", got_auth == expected,
       "" if got_auth == expected else "got=%s\n      exp=%s" % (got_auth, expected))
 
+print("\n=== T9 流正文被掐断：客户端要拿到错误帧，而不是无声断流 ===")
+BREAK = requests.exceptions.ConnectionError(
+    "('Connection aborted.', ConnectionResetError(10054, '远程主机强迫关闭了一个现有的连接。'))")
+
+
+class BreakingResp(FakeResp):
+    """seq 里的异常对象在迭代到它时抛出（模拟 iter_lines 读正文时连接断）。"""
+
+    def __init__(self, seq, headers=None):
+        FakeResp.__init__(self, lines=[], headers=headers)
+        self._seq = seq
+
+    def iter_lines(self, decode_unicode=False):
+        for item in self._seq:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+
+def drain(resp):
+    parts, raised = [], None
+    try:
+        for piece in resp.response:
+            parts.append(piece if isinstance(piece, bytes) else piece.encode())
+    except BaseException as exc:
+        raised = type(exc).__name__
+    return b"".join(parts).decode("utf-8", "replace"), raised
+
+
+records.clear()
+server._upstream = FakeUpstream([BreakingResp([SSE_OK[0], SSE_OK[1], BREAK])])
+text, raised = drain(CLIENT.post("/v1/chat/completions", json=PAYLOAD))
+check("T9 断流前的内容已透传", '"content":"hi"' in text)
+check("T9 客户端收到错误帧", "upstream stream interrupted" in text and "ConnectionError" in text,
+      text[-120:])
+check("T9 错误帧后补 [DONE]", text.rstrip().endswith("data: [DONE]"))
+check("T9 异常继续上抛（保留 done 日志与堆栈）", raised == "ConnectionError", raised)
+check("T9 _stream_log 记了 stream 中断", any("stream 中断" in m for m in records))
+
+print("\n=== T10 benefit 流中断不得伪装成正常收尾 ===")
+records.clear()
+benefit_payload = dict(PAYLOAD, model="deepseek-v4-flash-0731")
+server._upstream = FakeUpstream([BreakingResp([SSE_OK[0], BREAK])])
+text, raised = drain(CLIENT.post("/v1/chat/completions", json=benefit_payload))
+check("T10 没有补 finish_reason=stop", '"finish_reason":"stop"' not in text)
+check("T10 收到错误帧", "upstream stream interrupted" in text)
+
+print("\n=== T11 非流式读正文中断 → 502 JSON（不是 500 HTML）===")
+
+
+class ContentBoomResp(FakeResp):
+    def __init__(self, error, headers=None):
+        FakeResp.__init__(self, lines=[],
+                          headers=headers or {"Content-Type": "application/json"})
+        self._error = error
+
+    @property
+    def content(self):
+        raise self._error
+
+
+non_stream = dict(PAYLOAD, stream=False)
+server._upstream = FakeUpstream([ContentBoomResp(BREAK)])
+resp = CLIENT.post("/v1/chat/completions", json=non_stream)
+body = resp.get_data(as_text=True)
+check("T11 返回 502", resp.status_code == 502, "status=%s" % resp.status_code)
+check("T11 是 JSON 且带原因", resp.is_json and "upstream stream interrupted" in body,
+      body[:120])
+
+print("\n=== T12 客户端断开（GeneratorExit）不能被当成上游中断 ===")
+long_stream = FakeResp(lines=SSE_OK[:1] * 40)
+server._upstream = FakeUpstream([long_stream])
+records.clear()
+resp = CLIENT.post("/v1/chat/completions", json=PAYLOAD)
+iterator = resp.response.__iter__()
+next(iterator)
+try:
+    iterator.close()          # 模拟客户端半路断开
+    closed_cleanly = True
+except BaseException as exc:  # pragma: no cover
+    closed_cleanly = False
+    print("   close() 抛了:", type(exc).__name__)
+check("T12 close() 干净结束", closed_cleanly)
+check("T12 记为 client 断开", any("client 断开" in m for m in records),
+      [m for m in records if "断开" in m][:1])
+check("T12 未误判为 stream 中断", not any("stream 中断" in m for m in records))
+
 print("\n通过 %d / %d" % (len(passed), len(passed) + len(failed)))
 if failed:
     print("失败:", failed)

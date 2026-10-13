@@ -1007,7 +1007,19 @@ def chat_completions():
 
             # 上游偶尔会在请求 stream=true 时返回普通 JSON，包装成单个 SSE 帧。
             if "text/event-stream" not in content_type:
-                result = _parse_upstream_json(upstream)
+                try:
+                    result = _parse_upstream_json(upstream)
+                except Exception as error:
+                    # 状态码已发出，只能以错误帧收尾，别让流无声断掉
+                    logger.error("[%s] 非 SSE 响应读取中断: %s: %s",
+                                 rid, type(error).__name__, error)
+                    yield b"data: " + json.dumps(
+                        {"error": {"message": "upstream stream interrupted: %s" % error,
+                                  "type": "upstream_error",
+                                  "code": type(error).__name__}},
+                        ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
+                    yield b"data: [DONE]\n\n"
+                    return
                 for choice in result.get("choices") or []:
                     if choice.get("finish_reason") in (None, "other"):
                         choice["finish_reason"] = "stop"
@@ -1016,7 +1028,19 @@ def chat_completions():
                 yield b"data: [DONE]\n\n"
                 return
 
-            for raw_line in upstream.iter_lines(decode_unicode=False):
+            # iter_lines 在读响应体阶段抛的是原生传输异常（读超时、连接被复位、
+            # chunked 流断裂）。此时状态码已经发出去，改不了，只能先记下来，
+            # 循环结束后用 SSE 错误帧收尾，避免客户端只看到一条被掐断的流。
+            broken = {"error": None}
+
+            def upstream_lines():
+                try:
+                    for raw_line in upstream.iter_lines(decode_unicode=False):
+                        yield raw_line
+                except Exception as error:
+                    broken["error"] = error
+
+            for raw_line in upstream_lines():
                 if not raw_line:
                     continue
                 if not raw_line.startswith(b"data:"):
@@ -1071,6 +1095,20 @@ def chat_completions():
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
 
+            # 上游把流掐断了：先给客户端一个明确的错误帧，再把异常原样抛出，
+            # 保留 _stream_log 的 "stream 中断" 日志与堆栈。这里必须跳过下面的
+            # 补尾逻辑，否则会给半截回答补一个 finish_reason=stop，伪装成正常收尾。
+            if broken["error"] is not None:
+                error = broken["error"]
+                if not saw_done:
+                    yield b"data: " + json.dumps(
+                        {"error": {"message": "upstream stream interrupted: %s" % error,
+                                  "type": "upstream_error",
+                                  "code": type(error).__name__}},
+                        ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
+                    yield b"data: [DONE]\n\n"
+                raise error
+
             # 只对免费 benefit 模型补齐完全缺失的 finish_reason；不重发任何上游 chunk。
             if is_benefit and not saw_finish_reason:
                 yield b"data: " + json.dumps(
@@ -1102,7 +1140,18 @@ def chat_completions():
     # 非流式：无论上游返回 JSON 还是 SSE，都统一聚合成单个 JSON。
     # CodeArts 在排队、重试或特定模型场景下可能即使请求 stream=false
     # 仍返回 text/event-stream；直接转发会导致客户端把 data: 当作 JSON 解析。
-    result = _parse_upstream_json(upstream)
+    try:
+        result = _parse_upstream_json(upstream)
+    except Exception as error:
+        # 读正文时连接被掐：状态码还没发出去，可以正常报错。不接住会变成 Flask
+        # 默认 500 HTML 页，客户端拿到的是 "500 Internal Server Error" 而非原因。
+        logger.error("[%s] 上游响应读取中断: %s: %s", g.rid, type(error).__name__, error)
+        return (
+            _cors(jsonify({"error": {"message": "upstream stream interrupted: %s" % error,
+                                    "type": "upstream_error",
+                                    "code": type(error).__name__}})),
+            502,
+        )
     if isinstance(result, dict) and result.get("error"):
         logger.error("[%s] [502] 上游业务错误: %s", g.rid, result.get("error"))
         resp = Response(
