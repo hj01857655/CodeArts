@@ -238,6 +238,11 @@ def _try_refresh(storage_dir, session):
     verifier = pkce.get("codeVerifier") or pkce.get("code_verifier")
     private_jwk = dpop.get("privateKeyJwk") or dpop.get("private_key_jwk")
     if not (refresh_token and verifier and private_jwk):
+        # 缺任一项就得不出 DPoP proof；不打原因的话看起来像“没反应”，只会看到上游持续 401
+        missing = [n for n, v in (("refresh_token", refresh_token),
+                                 ("loginContext.pkcePair.codeVerifier", verifier),
+                                 ("loginContext.dpopKeyPair.privateKeyJwk", private_jwk)) if not v]
+        print(f"[credential_provider] IDE 会话凭证跳过刷新：缺 {'、'.join(missing)}")
         return None
     try:
         headers = {
@@ -366,6 +371,11 @@ def _refresh_auth_file(cred):
     dpop_jwk = cred.get("dpop_private_key")
     client_id = cred.get("client_id") or _CLIENT_ID
     if not (refresh_token and verifier and dpop_jwk and dpop_jwk.get("d")):
+        # 注意：dpop_private_key 必须是含 d 的 JWK 对象，空值/字符串都会落到这里
+        missing = [n for n, v in (("refresh_token", refresh_token),
+                                 ("code_verifier", verifier),
+                                 ("dpop_private_key.d", dpop_jwk.get("d") if isinstance(dpop_jwk, dict) else None)) if not v]
+        print(f"[credential_provider] auth 文件跳过刷新：缺 {'、'.join(missing)}")
         return None
     try:
         headers = {

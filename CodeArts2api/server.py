@@ -62,6 +62,9 @@ OPENGW_CONFIG_URL = OPENGW_BASE + "/api/v1/gateway/config"
 BENEFIT_AUTO_CLAIM = os.getenv("CODEARTS_BENEFIT_AUTO_CLAIM", "1").strip() not in ("0", "false", "False", "no", "")
 # 上游业务错误码：并发限流可退避重试，积分耗尽不可重试直接透传语义
 UPSTREAM_RETRY_CODES = {"TM.00001041"}
+# STS 临时凭证过期（APIG.0602）与 AK 校验失败（APIG.0301）：
+# 这类错误重试同一把凭证永远的结果一样，必须先换凭证
+UPSTREAM_AUTH_CODES = {"APIG.0602", "APIG.0301"}
 UPSTREAM_RETRY_MAX = 3
 UPSTREAM_RETRY_BACKOFF = 2.0
 UPSTREAM_CREDIT_CODES = {"TM.00001050"}
@@ -962,6 +965,7 @@ def chat_completions():
 
     attempt = 0
     conn_attempt = 0
+    auth_retry = False
     while True:
         # x-sdk-date 参与签名，每次重发都要重新签一遍，避免复用旧时间戳
         headers = _hmac_headers(body, benefit=benefit, model_id=model)
@@ -1013,6 +1017,21 @@ def chat_completions():
                            g.rid, error_code, delay, attempt, UPSTREAM_RETRY_MAX)
             time.sleep(delay)
             continue
+
+        # 凭证失效：_current_creds() 有 30s 缓存，不强制重读就会拿同一把死 STS 反复重签。
+        # 这里强制重读（内部会触发一次 refresh）后重发，对客户端透明。
+        auth_bad = (upstream.status_code == 401
+                    or error_code in UPSTREAM_AUTH_CODES
+                    or "expired" in error_msg.lower())
+        if auth_bad and not auth_retry:
+            auth_retry = True
+            logger.warning("[%s] [凭证] 上游判凭证失效（HTTP %s %s），强制重读凭证后重试一次",
+                           g.rid, upstream.status_code, error_code or error_msg[:60])
+            credential_provider.load_credentials(force=True)
+            continue
+        if auth_bad and auth_retry:
+            logger.error("[%s] [凭证] 重读凭证后仍被上游拒绍（%s）：需重新登录（python oauth.py），或看上方 credential_provider 的刷新失败原因",
+                         g.rid, error_code or upstream.status_code)
 
         logger.error("[%s] [502] 上游返回非 200: status=%d body=%.500s",
                      g.rid, upstream.status_code, detail)
