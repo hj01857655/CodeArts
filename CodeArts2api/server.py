@@ -960,6 +960,13 @@ def chat_completions():
     # 客户端是否要流式
     want_stream = bool(req_json.get("stream", False))
 
+    if not want_stream:
+        # 实测 2026-10-14：GLM-5.2 / openpangu-2.0-flash 在 stream=false 下返回
+        # message.content=""（正文丢在上游，usage 里却呯地计入 reasoning_tokens），
+        # 而同样提问走流式能正常拿到结果。因此统一向上游要流，
+        # 由下方 _parse_upstream_json 聚合成单个 JSON：对客户端仍是非流式。
+        req_json["stream"] = True
+
     # 重新序列化 body（确保与签名时一致）
     body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
 
