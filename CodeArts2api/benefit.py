@@ -208,13 +208,50 @@ def show_balance() -> None:
 
 
 def show_status() -> None:
-    info = claim_status()
-    print(f"最近签到时间: {_fmt_time(info.get('create_time'))}")
+    """人读的今日状态。
+
+    三个数据源是三件事，不能互相代替（以前只打一行、标签还叫“最近签到时间”，
+    会让人误判“没签到”而重复跑 claim）：
+      • 权益包记录（opengw /benefit/claim）：09-17 建的一次性记实，不随每日变化
+      • 每日额度（daily_*）：今天 1000 万 token 到账没有
+      • 积分活动（campaignId=1）：今天的 1000 积分领了没有
+    每一项单独降级：一个接口拖（snap-access 偶发 TLS 中断）不应拖死整个 status。
+    """
+    try:
+        info = claim_status()
+        created = _fmt_time(info.get("create_time"))
+        updated = _fmt_time(info.get("update_time"))
+        note = "（一次性，不随每日变化，不代表签到）" if info.get("create_time") == info.get("update_time") else ""
+        print(f"权益包: 创建于 {created}，更新 {updated}{note}")
+    except Exception as error:
+        print(f"权益包: 查询失败 {str(error)[:120]}")
+
+    try:
+        b = balance()
+        limit = b.get("daily_token_limit") or b.get("total_quota") or 0
+        used = b.get("daily_tokens_used") if b.get("daily_tokens_used") is not None else b.get("used_amount")
+        remain = b.get("total_balance") or 0
+        got = "已到账" if limit else "未到账"
+        print(f"每日额度: {got} {limit:,}（已用 {used if used is not None else '?'}，余额 {remain:,}）")
+    except Exception as error:
+        print(f"每日额度: 查询失败 {str(error)[:120]}")
+
+    try:
+        day = next((i for i in credit_activities() if i.get("campaignId") == CREDIT_CAMPAIGN_ID), None)
+        if day is None:
+            print("积分签到: 未找到每日签到活动")
+        else:
+            state = day.get("status") or "?"
+            print(f"积分签到: status={state} claimable={day.get('claimable')}"
+                  f" → {'今日已领' if state in ('CLAIMED', 'CONFIRMED', 'CONSUMED') else '今日可领'}")
+    except Exception as error:
+        print(f"积分签到: 查询失败 {str(error)[:120]}")
 
 
 def do_claim() -> None:
     info = claim()
-    print(f"签到成功，最近签到时间: {_fmt_time(info.get('create_time'))}")
+    # 注意：这条回的是权益包记录的创建时间，不是“本次领取时间”
+    print(f"已请求领取权益，权益包创建于: {_fmt_time(info.get('create_time'))}")
 
 
 def show_models() -> None:
