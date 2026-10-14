@@ -547,6 +547,11 @@ def _refresh_models() -> bool:
 _refresh_trigger_lock = threading.Lock()
 _refresh_in_progress = False
 
+# 模型名查不到时的强制同步节流（见 _force_sync_models_for）
+FORCED_SYNC_MIN_INTERVAL = 20.0
+_last_forced_sync = 0.0
+_forced_sync_lock = threading.Lock()
+
 
 def _refresh_models_if_needed() -> None:
     """模型列表短时缓存，避免 Cherry Studio 频繁轮询时重复请求。
@@ -581,6 +586,29 @@ def _refresh_models_if_needed() -> None:
             _refresh_in_progress = False
 
     threading.Thread(target=_background_refresh, daemon=True, name="model-refresh").start()
+
+
+def _force_sync_models_for(model: str) -> bool:
+    """请求的模型不在列表里时，**同步**再同步一次模型清单，返回是否因此命中。
+
+    为什么需要：`_refresh_models_if_needed()` 的策略是缓存过期就只起后台刷新、
+    当前请求照用旧列表（避免上游变慢拖住对话）。福利模型是动态投放的，于是"上游
+    刚放出某个模型"到"本地缓存追上"之间有一段窗口，期间每次请求都会被本地判定
+    成 model_not_found 直接 404 —— 实测 2026-10-14 05:01 那串 404 就是这么来的：
+    `deepseek-v4.1-flash` 05:00:48 那次同步还没有，05:07:30 才进缓存。
+
+    带节流：一个模型名查不到，可能是客户端配置写错了并在重试。没有这个窗口就会
+    变成"每次坏请求都打一遍上游"。
+    """
+    global _last_forced_sync
+    now = time.time()
+    with _forced_sync_lock:
+        if now - _last_forced_sync < FORCED_SYNC_MIN_INTERVAL:
+            return model in SUPPORTED_MODELS
+        _last_forced_sync = now
+    if _refresh_models():
+        return model in SUPPORTED_MODELS
+    return model in SUPPORTED_MODELS
 
 
 def _normalize_finish_reason(value):
@@ -894,21 +922,30 @@ def chat_completions():
     _refresh_models_if_needed()
     model = req_json.get("model", SUPPORTED_MODELS[0])
     if model not in SUPPORTED_MODELS:
-        return (
-            _cors(
-                jsonify(
-                    {
-                        "error": {
-                            "message": f"model '{model}' 不在当前账号可用模型列表中",
-                            "type": "invalid_request_error",
-                            "param": "model",
-                            "code": "model_not_found",
+        # 先给缓存一次同步纠正的机会：福利模型是动态投放的，后台刷新还没落地时
+        # 本地会误判成"不存在"直接 404（实测 2026-10-14 05:01 那串 404 即此）。
+        if not _force_sync_models_for(model):
+            return (
+                _cors(
+                    jsonify(
+                        {
+                            "error": {
+                                # 带上当前可用列表：原来只说"不在可用列表中"，
+                                # 得去翻 models-cache.json 才知道能填什么。
+                                "message": (
+                                    f"model '{model}' 不在当前账号可用模型列表中，"
+                                    f"可用：{', '.join(SUPPORTED_MODELS)}"
+                                ),
+                                "type": "invalid_request_error",
+                                "param": "model",
+                                "code": "model_not_found",
+                            }
                         }
-                    }
-                )
-            ),
-            404,
-        )
+                    )
+                ),
+                404,
+            )
+        logger.info("模型 %s 经强制同步后命中，继续处理请求", model)
     req_json["model"] = model
     # 输出上限必须在签名前收敛：签名覆盖 body 哈希，钳制必须在重序列化之前完成
     _clamp_max_tokens(req_json)
