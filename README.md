@@ -2,16 +2,6 @@
 
 华为云 CodeArts Agent 的逆向成果，以及免费额度 OpenAI 兼容代理（`CodeArts2api`，端口 **8787**）。
 
-## 目录
-
-| 目录 | 内容 |
-| --- | --- |
-| [`docs/`](docs/) | 逆向文档 00–09：应用架构、OAuth2 认证链、Bun 内核与 IPC、三套签名器、运行时数据与 wire 协议、技能规则体系、对话接口协议、benefit 权益与每日额度、认证实操指南 |
-| [`CodeArts2api/`](CodeArts2api/) | 主产物：OpenAI 兼容代理（详见其 README） |
-| `tools/` | 取证与调试脚本：签名复现、凭证解码、用量/余额查询、抓包分析、Bun 单文件抽取等 |
-| `re/` | Bun 内核抽取产物（`bun_extract/` 为内嵌 chunk 与 zip）；`capture/` 为抓包样本，含会话凭据，已 gitignore |
-| `codearts-daily-claim/` | 每日福利领取脚本（独立小工具，不入本仓库） |
-
 ## CodeArts2api 速览
 
 ```bash
