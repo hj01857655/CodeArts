@@ -32,6 +32,7 @@ from requests.adapters import HTTPAdapter
 import benefit
 import credential_provider
 import responses_bridge as rb
+import anthropic_bridge as ab
 
 load_dotenv()
 
@@ -1369,6 +1370,102 @@ def responses_api():
             502,
         )
     return _cors(jsonify(rb.chat_json_to_responses(result, model)))
+
+
+# ── Anthropic Messages 端点（Claude Code 等原生 Anthropic 客户端）──────────────
+# 与 /v1/responses 同构：anthropic_bridge 把 Anthropic ⇄ Chat 翻掉，复用
+# 既有上游管线（签名/鉴权/重试）；响应侧包成 Anthropic SSE。
+@app.route("/v1/messages", methods=["POST"])
+def messages_api():
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+
+    body = request.get_data()
+    if not body:
+        return _cors(jsonify(ab.error_body("invalid_request_error", "empty body"))), 400
+    try:
+        req_json = json.loads(body)
+    except Exception:
+        return _cors(jsonify(ab.error_body("invalid_request_error", "invalid JSON body"))), 400
+    if not isinstance(req_json, dict):
+        return _cors(jsonify(ab.error_body("invalid_request_error", "invalid JSON body"))), 400
+
+    chat_req = ab.anthropic_to_chat(req_json)
+    if not chat_req.get("messages"):
+        return _cors(jsonify(ab.error_body("invalid_request_error", "empty messages"))), 400
+
+    _sanitize_tool_calls(chat_req)
+    _refresh_models_if_needed()
+    model = chat_req.get("model", SUPPORTED_MODELS[0])
+    if model not in SUPPORTED_MODELS:
+        if not _force_sync_models_for(model):
+            return (
+                _cors(jsonify(ab.error_body("invalid_request_error",
+                    "model '%s' 不在当前账号可用模型列表中，可用：%s" % (model, ", ".join(SUPPORTED_MODELS))))),
+                404,
+            )
+        logger.info("模型 %s 经强制同步后命中，继续处理请求", model)
+    chat_req["model"] = model
+    _clamp_max_tokens(chat_req)
+
+    benefit = model not in AGENT_MODELS
+    want_stream = bool(chat_req.get("stream", False))
+    if not want_stream:
+        chat_req["stream"] = True
+
+    upstream, err = _send_upstream(chat_req, model, benefit)
+    if err is not None:
+        return err
+
+    if want_stream:
+        rid, t0 = g.rid, g.t0
+        is_sse = "text/event-stream" in (upstream.headers.get("Content-Type") or "").lower()
+
+        def generate():
+            if is_sse:
+                for frame in ab.chat_sse_to_anthropic(
+                        upstream.iter_lines(decode_unicode=False), model):
+                    yield frame
+                return
+            try:
+                result = _parse_upstream_json(upstream)
+            except Exception as error:
+                logger.error("[%s] [messages] 非 SSE 响应读取中断: %s: %s",
+                             rid, type(error).__name__, error)
+                yield ab.error_sse("api_error",
+                    "upstream stream interrupted: %s" % error)
+                return
+            if isinstance(result, dict) and result.get("error"):
+                logger.error("[%s] [messages] [502] 上游业务错误: %s",
+                             rid, result.get("error"))
+                yield ab.error_sse("api_error", str(result.get("error")))
+                return
+            for frame in ab.chat_json_to_anthropic_sse(result, model):
+                yield frame
+
+        resp = Response(_stream_log(generate(), rid, t0), status=200,
+                        mimetype="text/event-stream")
+        resp.headers["Cache-Control"] = "no-cache, no-transform"
+        resp.headers["Content-Type"] = "text/event-stream; charset=utf-8"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return _cors(resp)
+
+    try:
+        result = _parse_upstream_json(upstream)
+    except Exception as error:
+        logger.error("[%s] [messages] 上游响应读取中断: %s: %s",
+                     g.rid, type(error).__name__, error)
+        return (
+            _cors(jsonify(ab.error_body("api_error", "upstream stream interrupted: %s" % error))),
+            502,
+        )
+    if isinstance(result, dict) and result.get("error"):
+        logger.error("[%s] [messages] [502] 上游业务错误: %s", g.rid, result.get("error"))
+        return (
+            _cors(jsonify(ab.error_body("api_error", str(result.get("error"))))),
+            502,
+        )
+    return _cors(jsonify(ab.chat_json_to_anthropic(result, model)))
 
 
 # ── 积分余额（snap-access 网关，agent 通道模型消耗）──────────────────────
