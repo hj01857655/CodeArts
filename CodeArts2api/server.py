@@ -31,6 +31,7 @@ from requests.adapters import HTTPAdapter
 
 import benefit
 import credential_provider
+import responses_bridge as rb
 
 load_dotenv()
 
@@ -905,6 +906,102 @@ def _sanitize_tool_calls(req_json: dict) -> None:
             len(msgs), len(out))
 
 
+def _send_upstream(req_json: dict, model: str, benefit: bool):
+    """签名并发给上游，含连接级/限流/凭证三类重试。
+
+    chat 与 responses 两条路由共用。成功返回 (upstream, None)；
+    最终失败返回 (None, (status, response))，response 已包好 CORS，
+    调用方直接 return 即可。
+    """
+    # 重新序列化 body（确保与签名时一致）
+    body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
+
+    attempt = 0
+    conn_attempt = 0
+    auth_retry = False
+    while True:
+        # x-sdk-date 参与签名，每次重发都要重新签一遍，避免复用旧时间戳
+        headers = _hmac_headers(body, benefit=benefit, model_id=model)
+        try:
+            upstream = _upstream.post(
+                TARGET, data=body, headers=headers, stream=True, timeout=(10, 600)
+            )
+        except Exception as e:
+            # TLS 中断/连接重置：一个响应字节都没拿到，换新连接重发
+            if conn_attempt < CONN_RETRY_MAX and _is_conn_retryable(e):
+                conn_attempt += 1
+                delay = CONN_RETRY_BACKOFF * conn_attempt
+                logger.warning("[%s] [重试] 上游连接级失败（%s），%.1fs 后第 %d/%d 次重发",
+                               g.rid, type(e).__name__, delay, conn_attempt, CONN_RETRY_MAX)
+                time.sleep(delay)
+                continue
+            logger.error("[%s] 上游请求异常: %s", g.rid, e)
+            return None, (_cors(jsonify({"error": {"message": f"upstream error: {e}"}})), 502)
+
+        if upstream.status_code == 200:
+            return upstream, None
+
+        # 响应尚未开始，此处重试对客户端完全透明（流式同样适用）
+        detail = ""
+        error_code = ""
+        error_msg = ""
+        try:
+            detail = upstream.text[:2000]
+            err = upstream.json()
+            error_code = str(err.get("error_code") or "")
+            error_msg = str(err.get("error_msg") or "")
+        except Exception:
+            pass
+
+        # 积分耗尽：重试无意义，透传上游语义（402 避免客户端自动重试循环）
+        if error_code in UPSTREAM_CREDIT_CODES:
+            logger.warning("[%s] [402] 上游积分耗尽: %s %s", g.rid, error_code, error_msg)
+            return None, (_cors(jsonify({"error": {
+                "message": error_msg or "upstream credits exhausted",
+                "type": "insufficient_quota",
+                "code": error_code,
+            }})), 402)
+
+        # 并发限流：退避重试
+        if error_code in UPSTREAM_RETRY_CODES and attempt < UPSTREAM_RETRY_MAX:
+            attempt += 1
+            delay = UPSTREAM_RETRY_BACKOFF * attempt
+            logger.warning("[%s] [重试] 上游 %s，%.0fs 后第 %d/%d 次重试",
+                           g.rid, error_code, delay, attempt, UPSTREAM_RETRY_MAX)
+            time.sleep(delay)
+            continue
+
+        # 凭证失效：_current_creds() 有 30s 缓存，不强制重读就会拿同一把死 STS 反复重签。
+        # 这里强制重读（内部会触发一次 refresh）后重发，对客户端透明。
+        auth_bad = (upstream.status_code == 401
+                    or error_code in UPSTREAM_AUTH_CODES
+                    or "expired" in error_msg.lower())
+        if auth_bad and not auth_retry:
+            auth_retry = True
+            logger.warning("[%s] [凭证] 上游判凭证失效（HTTP %s %s），强制重读凭证后重试一次",
+                           g.rid, upstream.status_code, error_code or error_msg[:60])
+            credential_provider.load_credentials(force=True)
+            continue
+        if auth_bad and auth_retry:
+            logger.error("[%s] [凭证] 重读凭证后仍被上游拒绍（%s）：需重新登录（python oauth.py），或看上方 credential_provider 的刷新失败原因",
+                         g.rid, error_code or upstream.status_code)
+
+        logger.error("[%s] [502] 上游返回非 200: status=%d body=%.500s",
+                     g.rid, upstream.status_code, detail)
+        return None, (
+            _cors(
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"upstream {upstream.status_code}: {detail}"
+                        }
+                    }
+                )
+            ),
+            502,
+        )
+
+
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def chat_completions():
     if request.method == "OPTIONS":
@@ -967,93 +1064,10 @@ def chat_completions():
         # 由下方 _parse_upstream_json 聚合成单个 JSON：对客户端仍是非流式。
         req_json["stream"] = True
 
-    # 重新序列化 body（确保与签名时一致）
-    body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
-
-    attempt = 0
-    conn_attempt = 0
-    auth_retry = False
-    while True:
-        # x-sdk-date 参与签名，每次重发都要重新签一遍，避免复用旧时间戳
-        headers = _hmac_headers(body, benefit=benefit, model_id=model)
-        try:
-            upstream = _upstream.post(
-                TARGET, data=body, headers=headers, stream=True, timeout=(10, 600)
-            )
-        except Exception as e:
-            # TLS 中断/连接重置：一个响应字节都没拿到，换新连接重发
-            if conn_attempt < CONN_RETRY_MAX and _is_conn_retryable(e):
-                conn_attempt += 1
-                delay = CONN_RETRY_BACKOFF * conn_attempt
-                logger.warning("[%s] [重试] 上游连接级失败（%s），%.1fs 后第 %d/%d 次重发",
-                               g.rid, type(e).__name__, delay, conn_attempt, CONN_RETRY_MAX)
-                time.sleep(delay)
-                continue
-            logger.error("[%s] 上游请求异常: %s", g.rid, e)
-            return _cors(jsonify({"error": {"message": f"upstream error: {e}"}})), 502
-
-        if upstream.status_code == 200:
-            break
-
-        # 响应尚未开始，此处重试对客户端完全透明（流式同样适用）
-        detail = ""
-        error_code = ""
-        error_msg = ""
-        try:
-            detail = upstream.text[:2000]
-            err = upstream.json()
-            error_code = str(err.get("error_code") or "")
-            error_msg = str(err.get("error_msg") or "")
-        except Exception:
-            pass
-
-        # 积分耗尽：重试无意义，透传上游语义（402 避免客户端自动重试循环）
-        if error_code in UPSTREAM_CREDIT_CODES:
-            logger.warning("[%s] [402] 上游积分耗尽: %s %s", g.rid, error_code, error_msg)
-            return _cors(jsonify({"error": {
-                "message": error_msg or "upstream credits exhausted",
-                "type": "insufficient_quota",
-                "code": error_code,
-            }})), 402
-
-        # 并发限流：退避重试
-        if error_code in UPSTREAM_RETRY_CODES and attempt < UPSTREAM_RETRY_MAX:
-            attempt += 1
-            delay = UPSTREAM_RETRY_BACKOFF * attempt
-            logger.warning("[%s] [重试] 上游 %s，%.0fs 后第 %d/%d 次重试",
-                           g.rid, error_code, delay, attempt, UPSTREAM_RETRY_MAX)
-            time.sleep(delay)
-            continue
-
-        # 凭证失效：_current_creds() 有 30s 缓存，不强制重读就会拿同一把死 STS 反复重签。
-        # 这里强制重读（内部会触发一次 refresh）后重发，对客户端透明。
-        auth_bad = (upstream.status_code == 401
-                    or error_code in UPSTREAM_AUTH_CODES
-                    or "expired" in error_msg.lower())
-        if auth_bad and not auth_retry:
-            auth_retry = True
-            logger.warning("[%s] [凭证] 上游判凭证失效（HTTP %s %s），强制重读凭证后重试一次",
-                           g.rid, upstream.status_code, error_code or error_msg[:60])
-            credential_provider.load_credentials(force=True)
-            continue
-        if auth_bad and auth_retry:
-            logger.error("[%s] [凭证] 重读凭证后仍被上游拒绍（%s）：需重新登录（python oauth.py），或看上方 credential_provider 的刷新失败原因",
-                         g.rid, error_code or upstream.status_code)
-
-        logger.error("[%s] [502] 上游返回非 200: status=%d body=%.500s",
-                     g.rid, upstream.status_code, detail)
-        return (
-            _cors(
-                jsonify(
-                    {
-                        "error": {
-                            "message": f"upstream {upstream.status_code}: {detail}"
-                        }
-                    }
-                )
-            ),
-            502,
-        )
+    # 签名/发送/重试统一走 _send_upstream（与 responses 路由共用）
+    upstream, err = _send_upstream(req_json, model, benefit)
+    if err is not None:
+        return err
 
     if want_stream:
         # generate() 是惰性生成器，迭代时请求上下文已结束，不能再碰 flask.g
@@ -1226,6 +1240,135 @@ def chat_completions():
     output = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     resp = Response(output, status=200, content_type="application/json; charset=utf-8")
     return _cors(resp)
+
+
+# ── OpenAI Responses 端点（grok-build / Codex 等原生 Responses 客户端）──────
+@app.route("/v1/responses", methods=["POST", "OPTIONS"])
+def responses_api():
+    """Responses 协议入口：请求体经 responses_bridge 转成 Chat 后走既有上游
+    管线（签名/鉴权/重试全部复用），响应侧把 Chat SSE 包回 Responses SSE
+    （每帧带 sequence_number，grok 类型级强制）。"""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+
+    body = request.get_data()
+    if not body:
+        return _cors(jsonify({"error": {"message": "empty body"}})), 400
+    try:
+        req_json = json.loads(body)
+    except Exception:
+        return _cors(jsonify({"error": {"message": "invalid JSON body"}})), 400
+    if not isinstance(req_json, dict):
+        return _cors(jsonify({"error": {"message": "invalid JSON body"}})), 400
+
+    chat_req = rb.responses_to_chat(req_json)
+    if not chat_req.get("messages"):
+        return _cors(jsonify({"error": {"message": "empty input"}})), 400
+
+    # 与 chat 路径同款的清洗/归一化/钳制（签名前完成）
+    _sanitize_tool_calls(chat_req)
+    _refresh_models_if_needed()
+    model = chat_req.get("model", SUPPORTED_MODELS[0])
+    if model not in SUPPORTED_MODELS:
+        # 先给缓存一次同步纠正的机会：福利模型动态投放，同 chat 路径注释
+        if not _force_sync_models_for(model):
+            return (
+                _cors(
+                    jsonify(
+                        {
+                            "error": {
+                                "message": (
+                                    f"model '{model}' 不在当前账号可用模型列表中，"
+                                    f"可用：{', '.join(SUPPORTED_MODELS)}"
+                                ),
+                                "type": "invalid_request_error",
+                                "param": "model",
+                                "code": "model_not_found",
+                            }
+                        }
+                    )
+                ),
+                404,
+            )
+        logger.info("模型 %s 经强制同步后命中，继续处理请求", model)
+    chat_req["model"] = model
+    _clamp_max_tokens(chat_req)
+
+    benefit = model not in AGENT_MODELS
+    want_stream = bool(chat_req.get("stream", False))
+    if not want_stream:
+        # 同 chat 路径：统一向上游要流，非流式在此聚合成单个 Responses JSON
+        chat_req["stream"] = True
+
+    upstream, err = _send_upstream(chat_req, model, benefit)
+    if err is not None:
+        return err
+
+    if want_stream:
+        # 同 chat 路径：生成器迭代时请求上下文已结束，先抓上下文字段
+        rid, t0 = g.rid, g.t0
+        is_sse = "text/event-stream" in (upstream.headers.get("Content-Type") or "").lower()
+
+        def generate():
+            if is_sse:
+                # 常规：Chat SSE 逐帧包成 Responses SSE
+                for frame in rb.chat_sse_to_responses(
+                        upstream.iter_lines(decode_unicode=False), model):
+                    yield frame
+                return
+            # 上游偶尔 stream=true 仍回普通 JSON：聚合成单个 Chat JSON，
+            # 再以最小 Responses SSE 序列发出，客户端拿到的仍是合法流。
+            try:
+                result = _parse_upstream_json(upstream)
+            except Exception as error:
+                logger.error("[%s] [responses] 非 SSE 响应读取中断: %s: %s",
+                             rid, type(error).__name__, error)
+                for f in rb.response_json_to_sse(
+                        rb.error_response_obj(
+                            model, "upstream_error",
+                            "upstream stream interrupted: %s" % error)):
+                    yield f
+                return
+            if isinstance(result, dict) and result.get("error"):
+                logger.error("[%s] [responses] [502] 上游业务错误: %s",
+                             rid, result.get("error"))
+                for f in rb.response_json_to_sse(
+                        rb.error_response_obj(model, "upstream_error",
+                                              str(result.get("error")))):
+                    yield f
+                return
+            for f in rb.response_json_to_sse(
+                    rb.chat_json_to_responses(result, model)):
+                yield f
+
+        resp = Response(_stream_log(generate(), rid, t0), status=200,
+                        mimetype="text/event-stream")
+        resp.headers["Cache-Control"] = "no-cache, no-transform"
+        resp.headers["Content-Type"] = "text/event-stream; charset=utf-8"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return _cors(resp)
+
+    # 非流式：聚合成单个 Responses JSON
+    try:
+        result = _parse_upstream_json(upstream)
+    except Exception as error:
+        logger.error("[%s] [responses] 上游响应读取中断: %s: %s",
+                     g.rid, type(error).__name__, error)
+        return (
+            _cors(jsonify({"error": {"message": "upstream stream interrupted: %s" % error,
+                                    "type": "upstream_error",
+                                    "code": type(error).__name__}})),
+            502,
+        )
+    if isinstance(result, dict) and result.get("error"):
+        logger.error("[%s] [responses] [502] 上游业务错误: %s", g.rid, result.get("error"))
+        return (
+            _cors(jsonify({"error": {"message": str(result.get("error")),
+                                    "type": "upstream_error",
+                                    "code": "upstream_error"}})),
+            502,
+        )
+    return _cors(jsonify(rb.chat_json_to_responses(result, model)))
 
 
 # ── 积分余额（snap-access 网关，agent 通道模型消耗）──────────────────────
